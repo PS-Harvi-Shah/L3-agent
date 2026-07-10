@@ -4,11 +4,10 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.routes import router as data_access_router
+from app.api.routes import router as agent_router
 from app.config import get_settings
 from app.database.connection import check_database_connection
 from app.logging_config import configure_logging
-from app.observability.router import router as observability_router
 
 
 settings = get_settings()
@@ -17,10 +16,9 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.2.0",
+    version="1.0.0",
 )
-app.include_router(data_access_router)
-app.include_router(observability_router)
+app.include_router(agent_router)
 
 
 @app.get("/health", tags=["health"])

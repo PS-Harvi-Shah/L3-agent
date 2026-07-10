@@ -24,11 +24,16 @@ class Settings(BaseSettings):
 
     api_base_url: str = Field(default="http://localhost:8000", alias="API_BASE_URL")
 
+    # LLM (the agent's reasoning model)
     llm_provider: str = Field(default="ollama", alias="LLM_PROVIDER")
     llm_api_key: str | None = Field(default=None, alias="LLM_API_KEY")
-    llm_base_url: str = Field(default="http://localhost:11434/v1", alias="LLM_BASE_URL")
-    llm_model: str = Field(default="qwen3:8b", alias="LLM_MODEL")
-    llm_timeout: int = Field(default=60, alias="LLM_TIMEOUT")
+    llm_base_url: str = Field(default="http://localhost:11434", alias="LLM_BASE_URL")
+    llm_model: str = Field(default="qwen2.5:3b-instruct", alias="LLM_MODEL")
+    llm_timeout: int = Field(default=120, alias="LLM_TIMEOUT")
+
+    # Agent guardrails (bound the loop; they never make decisions)
+    agent_max_steps: int = Field(default=8, alias="AGENT_MAX_STEPS")
+    agent_deadline_seconds: float = Field(default=180.0, alias="AGENT_DEADLINE_SECONDS")
 
     model_config = SettingsConfigDict(
         env_file=".env",
