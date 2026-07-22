@@ -1,24 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
-
-
-class ORMBase(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-
-class SupplierRead(ORMBase):
-    supplier_id: int
-    supplier_name: str
-
-
-class ProductRead(ORMBase):
-    product_id: int
-    product_name: str
-    supplier_id: int
-    part_number: str | None = None
-    language: str | None = None
-    country: str | None = None
+from pydantic import BaseModel, Field
 
 
 class ToolInfo(BaseModel):

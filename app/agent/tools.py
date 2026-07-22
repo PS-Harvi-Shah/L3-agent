@@ -1,224 +1,170 @@
 """Tools the agent can invoke.
 
-Tools are the agent's hands, not its brain: each one is a deterministic,
-single-purpose lookup against the master-data repository. They never guess
-what the user meant — the agent supplies explicit arguments.
+The tools are no longer implemented here — they are discovered from the
+external Postgres MCP server and passed straight through to the LLM. This
+module only adapts between the MCP world and the agent loop:
+
+- MCP tool listings -> OpenAI function-calling specs for the LLM
+- LLM tool calls -> MCP ``call_tool`` requests
+- MCP results -> ``ToolResult`` observations
+
+The single decision this layer makes is a hard safety bound: SQL arguments
+must be read-only (SELECT/WITH), enforced before anything reaches the server.
 """
 
 import logging
+import re
 import time
-from dataclasses import dataclass
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Any
 
-from pydantic import BaseModel
-
-from app.repositories.exceptions import DataAccessError
-from app.repositories.master_data import MasterDataRepository
+from app.config import get_settings
+from app.mcp_client import MCPClient, MCPClientError
 
 
 logger = logging.getLogger("agent.tools")
+
+_SQL_ARG_NAMES = ("sql", "query", "statement")
+_READONLY_SQL = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+# Words that can make a SELECT/WITH statement write (data-modifying CTEs,
+# stacked statements, DDL). Advisory layer only — the DB role is the
+# guarantee — so false positives on string literals are acceptable.
+_FORBIDDEN_SQL = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|"
+    r"copy|vacuum|merge|call|do|execute|set)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
 class ToolResult:
     success: bool
-    data: dict[str, Any]
+    data: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     record_count: int = 0
     execution_time_ms: float = 0.0
 
 
-@dataclass
-class Tool:
-    name: str
-    description: str
-    parameters: dict[str, Any]
-    handler: Callable[[dict[str, Any]], dict[str, Any]]
-
-    @property
-    def spec(self) -> dict[str, Any]:
-        """OpenAI/Ollama function-calling tool definition."""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
-        }
-
-
 class ToolBelt:
-    """The executable tool set handed to the agent for one query."""
+    """The MCP server's tool set, handed to the agent for one query."""
 
-    def __init__(self, repo: MasterDataRepository) -> None:
-        self._repo = repo
-        self._tools: dict[str, Tool] = {t.name: t for t in self._build()}
+    def __init__(self, mcp: MCPClient) -> None:
+        self._mcp = mcp
+        discovered = {tool.name: tool for tool in mcp.list_tools()}
+        allowlist = {
+            name.strip()
+            for name in get_settings().mcp_tool_allowlist.split(",")
+            if name.strip()
+        }
+        if allowlist:
+            filtered = {n: t for n, t in discovered.items() if n in allowlist}
+            # If the server exposes none of the allowlisted names, show all
+            # tools rather than an empty catalog.
+            self._tools = filtered or discovered
+        else:
+            self._tools = discovered
 
     def specs(self) -> list[dict[str, Any]]:
-        return [tool.spec for tool in self._tools.values()]
+        """OpenAI/Ollama function-calling definitions of the MCP tools."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                },
+            }
+            for tool in self._tools.values()
+        ]
 
     def catalog(self) -> list[dict[str, Any]]:
         return [
-            {"name": t.name, "description": t.description, "parameters": t.parameters}
-            for t in self._tools.values()
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            }
+            for tool in self._tools.values()
         ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
-        tool = self._tools.get(name)
         start = time.perf_counter()
-        if tool is None:
+        if name not in self._tools:
             known = ", ".join(self._tools)
             return ToolResult(
                 success=False,
-                data={},
                 error=f"Unknown tool '{name}'. Available tools: {known}",
             )
-        try:
-            data = tool.handler(arguments)
-            elapsed = round((time.perf_counter() - start) * 1000, 2)
-            count = int(data.get("count", 0))
-            logger.info(
-                "Tool executed",
-                extra={
-                    "tool": name,
-                    "arguments": arguments,
-                    "record_count": count,
-                    "execution_time_ms": elapsed,
-                },
-            )
-            return ToolResult(
-                success=True, data=data, record_count=count, execution_time_ms=elapsed
-            )
-        except (ValueError, TypeError) as exc:
-            elapsed = round((time.perf_counter() - start) * 1000, 2)
+
+        blocked = _blocked_sql(arguments)
+        if blocked:
             logger.warning(
-                "Tool rejected arguments",
-                extra={"tool": name, "arguments": arguments, "error": str(exc)},
+                "Blocked non-read-only SQL", extra={"tool": name, "sql": blocked}
             )
             return ToolResult(
-                success=False, data={}, error=f"Invalid arguments: {exc}", execution_time_ms=elapsed
+                success=False,
+                error=(
+                    "Rejected: only a single read-only SQL statement (SELECT or "
+                    "WITH ... SELECT) is allowed — no data-modifying keywords, no "
+                    "stacked statements. Rewrite it as one plain SELECT."
+                ),
             )
-        except DataAccessError as exc:
+
+        try:
+            result = self._mcp.call_tool(name, arguments)
+        except MCPClientError as exc:
             elapsed = round((time.perf_counter() - start) * 1000, 2)
-            logger.exception("Tool database error", extra={"tool": name, "arguments": arguments})
+            logger.exception("MCP tool call failed", extra={"tool": name})
+            return ToolResult(success=False, error=str(exc), execution_time_ms=elapsed)
+
+        elapsed = round((time.perf_counter() - start) * 1000, 2)
+        if not result.success:
+            logger.warning(
+                "Tool returned an error",
+                extra={"tool": name, "arguments": arguments, "error": result.error},
+            )
             return ToolResult(
-                success=False, data={}, error=f"Database error: {exc}", execution_time_ms=elapsed
+                success=False, error=result.error, execution_time_ms=elapsed
             )
 
-    def _build(self) -> list[Tool]:
-        return [
-            Tool(
-                name="search_master_data",
-                description=(
-                    "Search the master data by ONE identifier interpretation. "
-                    "identifier_type says how to interpret the value: 'product_id' (exact "
-                    "numeric id), 'part_number' (exact code, case-insensitive), "
-                    "'product_name' (partial, case-insensitive), 'supplier_id' (exact "
-                    "numeric id), or 'supplier_name' (partial, case-insensitive). "
-                    "Product matches are returned WITH their supplier details already "
-                    "included — no further lookup is needed for a product's supplier."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "identifier_type": {
-                            "type": "string",
-                            "enum": [
-                                "product_id",
-                                "part_number",
-                                "product_name",
-                                "supplier_id",
-                                "supplier_name",
-                            ],
-                        },
-                        "value": {"type": "string", "description": "The identifier value."},
-                    },
-                    "required": ["identifier_type", "value"],
-                },
-                handler=self._search_master_data,
-            ),
-            Tool(
-                name="get_products_of_supplier",
-                description=(
-                    "List all products supplied by a known supplier. Use after finding a "
-                    "supplier to complete its master data."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "supplier_id": {
-                            "type": "integer",
-                            "description": "The supplier_id of the found supplier.",
-                        }
-                    },
-                    "required": ["supplier_id"],
-                },
-                handler=self._get_supplier_products,
-            ),
-        ]
-
-    # --- handlers -----------------------------------------------------------
-
-    def _search_master_data(self, args: dict[str, Any]) -> dict[str, Any]:
-        identifier_type = str(args.get("identifier_type", "")).strip().lower()
-        value = str(args.get("value", "")).strip()
-        if not value:
-            raise ValueError("'value' must not be empty")
-
-        if identifier_type == "product_id":
-            record = self._repo.get_product_by_id(_as_int(value, "product_id"))
-            products = [record] if record else []
-        elif identifier_type == "part_number":
-            products = self._repo.find_products_by_part_number(value)
-        elif identifier_type == "product_name":
-            products = self._repo.find_products_by_name(value)
-        elif identifier_type == "supplier_id":
-            record = self._repo.get_supplier_by_id(_as_int(value, "supplier_id"))
-            suppliers = [record] if record else []
-            return {"count": len(suppliers), "suppliers": _dump(suppliers)}
-        elif identifier_type == "supplier_name":
-            suppliers = self._repo.find_suppliers_by_name(value)
-            return {"count": len(suppliers), "suppliers": _dump(suppliers)}
-        else:
-            raise ValueError(
-                f"identifier_type must be one of product_id, part_number, product_name, "
-                f"supplier_id, supplier_name — got '{identifier_type}'."
-            )
-        return self._with_suppliers(_dump(products))
-
-    def _with_suppliers(self, products: list[dict[str, Any]]) -> dict[str, Any]:
-        """Join each product with its supplier record (deterministic data
-        consolidation — the agent still decides what to search and when)."""
-        suppliers: dict[int, dict[str, Any]] = {}
-        for product in products:
-            supplier_id = product.get("supplier_id")
-            if supplier_id is None or supplier_id in suppliers:
-                continue
-            record = self._repo.get_supplier_by_id(supplier_id)
-            if record is not None:
-                suppliers[supplier_id] = record.model_dump()
-        for product in products:
-            supplier = suppliers.get(product.get("supplier_id"))
-            product["supplier_name"] = supplier["supplier_name"] if supplier else None
-        return {
-            "count": len(products),
-            "products": products,
-            "suppliers": list(suppliers.values()),
-        }
-
-    def _get_supplier_products(self, args: dict[str, Any]) -> dict[str, Any]:
-        supplier_id = _as_int(args.get("supplier_id"), "supplier_id")
-        products = self._repo.get_products_by_supplier(supplier_id)
-        return self._with_suppliers(_dump(products))
+        data: dict[str, Any] = {"count": result.count}
+        if result.rows:
+            data["rows"] = result.rows
+        elif result.text.strip():
+            data["result"] = result.text
+        logger.info(
+            "Tool executed",
+            extra={
+                "tool": name,
+                "arguments": arguments,
+                "record_count": result.count,
+                "execution_time_ms": elapsed,
+            },
+        )
+        return ToolResult(
+            success=True,
+            data=data,
+            record_count=result.count,
+            execution_time_ms=elapsed,
+        )
 
 
-def _as_int(value: Any, name: str) -> int:
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        raise ValueError(f"'{name}' must be an integer, got '{value}'") from None
+def _blocked_sql(arguments: dict[str, Any]) -> str | None:
+    """Return the offending statement if any SQL argument is not read-only.
 
-
-def _dump(records: list[BaseModel | None]) -> list[dict[str, Any]]:
-    return [r.model_dump() for r in records if r is not None]
+    Rejects statements that (a) don't start with SELECT/WITH, (b) contain a
+    data-modifying/DDL keyword anywhere (closes the writing-CTE hole, e.g.
+    ``WITH x AS (INSERT ...) SELECT ...``), or (c) stack multiple statements
+    with ``;``.
+    """
+    for key, value in arguments.items():
+        if key.lower() in _SQL_ARG_NAMES and isinstance(value, str) and value.strip():
+            statement = value.strip()
+            if not _READONLY_SQL.match(statement):
+                return value
+            if _FORBIDDEN_SQL.search(statement):
+                return value
+            if ";" in statement.rstrip().rstrip(";"):
+                return value
+    return None

@@ -100,13 +100,17 @@ def render_response(response: dict[str, Any]) -> None:
     data = response.get("consolidated_data", {})
     products = data.get("products", [])
     suppliers = data.get("suppliers", [])
+    records = data.get("records", [])
     if products:
         st.markdown("##### Products")
         st.dataframe(products, use_container_width=True, hide_index=True)
     if suppliers:
         st.markdown("##### Suppliers")
         st.dataframe(suppliers, use_container_width=True, hide_index=True)
-    if not products and not suppliers:
+    if records:
+        st.markdown("##### Other records")
+        st.dataframe(records, use_container_width=True, hide_index=True)
+    if not products and not suppliers and not records:
         st.info("No records were retrieved for this identifier.")
 
     trace = response.get("reasoning_trace", [])
@@ -147,16 +151,17 @@ def render_response(response: dict[str, Any]) -> None:
 
 def render_agent_tab() -> None:
     st.caption(
-        "Enter any identifier — product ID, part number, product name, supplier ID, "
-        "or supplier name. The agent figures out what it is, retrieves the data, and "
-        "consolidates everything related to it."
+        "Ask about a product or supplier. State the identifier type explicitly "
+        "(product id, part number, product name, supplier id, or supplier name) "
+        "for the fastest, most reliable lookup — the agent still handles bare "
+        "values, but naming the type removes all guesswork."
     )
 
     with st.form("query_form", border=False):
         col1, col2 = st.columns([5, 1])
         query = col1.text_input(
             "Identifier",
-            placeholder="e.g. 3731599, A18-4, Acetone, 557, Merck",
+            placeholder="e.g. product id 3731599, part number A18-4, supplier name Merck",
             label_visibility="collapsed",
         )
         search = col2.form_submit_button("🔍 Search", type="primary", use_container_width=True)

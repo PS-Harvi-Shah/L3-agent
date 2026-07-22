@@ -2,15 +2,13 @@ import json
 import logging
 from typing import Annotated, Any, Iterator
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
 
 from app.agent import MasterDataAgent, ToolBelt
 from app.agent.audit import list_executions, load_execution, persist_execution
-from app.database.connection import get_db_session
 from app.llm import get_llm_client
-from app.repositories.master_data import MasterDataRepository
+from app.mcp_client import MCPClient
 from app.schemas import AgentQueryRequest, AgentQueryResponse, ToolInfo
 
 
@@ -18,17 +16,21 @@ router = APIRouter(tags=["agent"])
 logger = logging.getLogger("api")
 
 
+def get_mcp_client(request: Request) -> MCPClient:
+    return request.app.state.mcp_client
+
+
 def get_agent(
-    session: Annotated[Session, Depends(get_db_session)],
+    mcp: Annotated[MCPClient, Depends(get_mcp_client)],
 ) -> MasterDataAgent:
-    toolbelt = ToolBelt(MasterDataRepository(session))
-    return MasterDataAgent(get_llm_client(), toolbelt)
+    toolbelt = ToolBelt(mcp)
+    return MasterDataAgent(get_llm_client(), toolbelt, schema_summary=mcp.schema_summary)
 
 
 @router.get("/tools", response_model=list[ToolInfo])
-def list_tools(session: Annotated[Session, Depends(get_db_session)]) -> list[ToolInfo]:
-    """The tool catalog exposed to the agent."""
-    return [ToolInfo(**t) for t in ToolBelt(MasterDataRepository(session)).catalog()]
+def list_tools(mcp: Annotated[MCPClient, Depends(get_mcp_client)]) -> list[ToolInfo]:
+    """The tool catalog discovered from the MCP server and exposed to the agent."""
+    return [ToolInfo(**t) for t in ToolBelt(mcp).catalog()]
 
 
 @router.post("/agent/query", response_model=AgentQueryResponse)

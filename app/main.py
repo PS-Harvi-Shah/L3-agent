@@ -1,22 +1,40 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.routes import router as agent_router
 from app.config import get_settings
-from app.database.connection import check_database_connection
 from app.logging_config import configure_logging
+from app.mcp_client import MCPClient, MCPClientError
 
 
 settings = get_settings()
 configure_logging(settings)
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    client = MCPClient(settings)
+    try:
+        client.connect()
+    except MCPClientError:
+        # Start anyway so /health and /mcp-health can report the problem;
+        # agent queries will fail with a clear error until the server is up.
+        logger.exception("MCP server connection failed at startup")
+    app.state.mcp_client = client
+    try:
+        yield
+    finally:
+        client.close()
+
+
 app = FastAPI(
     title=settings.app_name,
-    version="1.0.0",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 app.include_router(agent_router)
 
@@ -30,23 +48,33 @@ def health() -> dict[str, str]:
     }
 
 
-@app.get("/db-health", tags=["health"])
-def db_health() -> JSONResponse:
+@app.get("/mcp-health", tags=["health"])
+def mcp_health() -> JSONResponse:
+    client: MCPClient = app.state.mcp_client
     try:
-        check_database_connection()
-        return JSONResponse(status_code=200, content={"status": "ok", "database": "connected"})
-    except SQLAlchemyError as exc:
-        logger.exception("Database health check failed")
-        detail = str(getattr(exc, "orig", exc))
+        tools = client.list_tools()
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "mcp_server": "connected",
+                "transport": settings.mcp_transport,
+                "tools": [t.name for t in tools],
+                "schema_summary": client.schema_summary,
+            },
+        )
+    except MCPClientError as exc:
+        logger.exception("MCP health check failed")
         return JSONResponse(
             status_code=503,
             content={
                 "status": "error",
-                "database": "unavailable",
-                "detail": detail,
+                "mcp_server": "unavailable",
+                "detail": str(exc),
                 "hint": (
-                    "Start PostgreSQL with `docker compose up -d` and verify "
-                    f"connection to {settings.postgres_host}:{settings.postgres_port}/{settings.postgres_db}"
+                    "Start the Postgres MCP server (e.g. `postgres-mcp "
+                    "--access-mode=restricted` with DATABASE_URI set) and "
+                    "restart this API."
                 ),
             },
         )

@@ -29,52 +29,77 @@ logger = logging.getLogger("agent")
 _SYSTEM_PROMPT = """
 You are the Planner for a Master Data Discovery Agent.
 
-Your objective is to retrieve and consolidate complete product master data from the available enterprise SQL databases based on a single user-provided identifier.
+Your objective is to retrieve and consolidate complete product master data from the enterprise PostgreSQL database based on the user's request. You do this by writing read-only SQL and executing it through the available database tools.
 
-Available data:
-- products(product_id, product_name, supplier_id, part_number, language, country)
-- suppliers(supplier_id, supplier_name)
+You are the sole decision-maker. Reason about the user's request and decide:
+1. What the user is asking for and which identifier they provided (product id, part number, product name, supplier id, or supplier name — part numbers can be numeric or alphanumeric).
+2. Which tool to invoke and what SQL to run.
+3. Whether additional queries are required.
+4. When enough information has been collected to satisfy the user's request.
 
-The user may provide any one of the following identifiers:
-- Product ID
-- Product Name
-- Supplier ID
-- Supplier Name
-- Part Number (numeric or alphanumeric)
+SQL rules:
+- SELECT (or WITH) statements only — never modify data.
+- Always schema-qualify tables (e.g. enterprise_data.products).
+- Use ILIKE '%...%' for matching names (case-insensitive, partial).
+- When returning products, JOIN the supplier so every product row includes its supplier's details.
+- Follow the foreign keys in the schema to join related tables that add detail.
+- Add LIMIT 25 to open-ended searches.
+- If a query returns an error, read the error message and fix the SQL.
 
-You are the sole decision-maker. Reason about the user's input and decide:
-1. What type of identifier the user most likely provided.
-2. Which tool should be invoked.
-3. What search strategy should be used.
-4. Whether additional retrieval steps are required.
-5. When enough information has been collected to satisfy the user's request.
+Interpreting identifiers:
+- If the user's request NAMES the identifier type (e.g. "product id", "part number", "supplier id", "supplier name", "product name" — in any phrasing, including typos/abbreviations like "prod id" or "part no"), TRUST IT. Query only that one column with a single WHERE clause. Do NOT run the multi-interpretation OR checks below — there is nothing ambiguous to resolve.
+- Only when the request gives a bare value with NO stated type, resolve ambiguity as follows:
+  - A purely numeric value is ambiguous: it can be a product_id, a part_number, or a supplier_id. Check ALL THREE in ONE query using OR (see example below).
+  - If that products query returns 0 rows, the number can STILL be a supplier with no products — check the suppliers table directly (SELECT * FROM enterprise_data.suppliers WHERE supplier_id = ...) before concluding that nothing exists.
+  - A value containing letters is a part_number ONLY if it looks like a compact code (e.g. 'A18-4'). Anything containing a space (e.g. 'Nitric Acid') is NEVER a part_number — it is a name. A name can be a product name OR a supplier name — check BOTH in ONE query: WHERE p.product_name ILIKE '%...%' OR s.supplier_name ILIKE '%...%' (see example below).
+- Repeating a query that already returned 0 rows will return 0 rows again — change the query instead.
+- As soon as a query returns rows, that interpretation is the answer — stop trying others.
 
-Do not assume the first interpretation is correct. If search_master_data returns 0 records, call it again with the next plausible identifier_type (a bare number can be a product_id, a part_number, or a supplier_id; text can be a product_name or a supplier_name). Only conclude that nothing exists after every plausible identifier_type has been tried. But as soon as ONE search returns records, that interpretation is the answer — stop trying other interpretations.
+Example queries:
+- Type stated ("product id 3731599") — single column, no OR:
+  SELECT p.*, s.supplier_name FROM enterprise_data.products p JOIN enterprise_data.suppliers s ON s.supplier_id = p.supplier_id WHERE p.product_id = 3731599;
+- Type stated ("part number 34860") — single column even though the value is numeric, because the type was named:
+  SELECT p.*, s.supplier_name FROM enterprise_data.products p JOIN enterprise_data.suppliers s ON s.supplier_id = p.supplier_id WHERE p.part_number = '34860';
+- Type stated ("supplier name Merck") — single column, matching supplier rows include their catalog:
+  SELECT p.*, s.supplier_name FROM enterprise_data.products p JOIN enterprise_data.suppliers s ON s.supplier_id = p.supplier_id WHERE s.supplier_name ILIKE '%merck%' LIMIT 25;
+- No type stated, bare number "557" — checked as product id, part number, and supplier id at once:
+  SELECT p.*, s.supplier_name FROM enterprise_data.products p JOIN enterprise_data.suppliers s ON s.supplier_id = p.supplier_id WHERE p.product_id = 557 OR p.part_number = '557' OR p.supplier_id = 557;
+- No type stated, bare text "Merck" — checked as product name and supplier name at once:
+  SELECT p.*, s.supplier_name FROM enterprise_data.products p JOIN enterprise_data.suppliers s ON s.supplier_id = p.supplier_id WHERE p.product_name ILIKE '%merck%' OR s.supplier_name ILIKE '%merck%' LIMIT 25;
 
-Answer scope depends on what the user's identifier resolves to:
-- PRODUCT (identifier_type product_id, part_number, or product_name): the search result already includes the product AND its supplier details. Finish immediately — do NOT list the supplier's other products; the user asked about one product, not the supplier's catalog.
-- SUPPLIER (identifier_type supplier_id or supplier_name): call get_products_of_supplier once to list its catalog, then finish.
+Answer scope:
+- If the user asked about one product, report that product and its supplier — do NOT list the supplier's whole catalog.
+- If the user asked about a supplier, include its product catalog.
 
-Never invent or infer database records. Base every decision solely on the retrieved data. If no matching records are found after exhausting all reasonable search strategies, clearly state that no matching data exists and suggest alternative identifiers the user could provide.
-
-Your responsibility is to plan and decide the next action. Every decision should be based on reasoning rather than assumptions.
+Never invent or infer database records. Base every statement on retrieved rows only. If nothing matches after every plausible interpretation, clearly state that no matching data exists and suggest alternative identifiers the user could provide.
 
 Rules:
 - Call at most ONE tool per turn, then wait for its result before deciding the next action.
-- Use only IDs that appear in records already retrieved — never guess an ID.
 - To finish, reply in plain text WITHOUT calling a tool: a short summary of what was found and how the records relate.
+"""
+
+_DISCOVER_SCHEMA_NOTE = """
+Database schema: unknown at startup. Before writing SQL, use the server's schema tools (e.g. list_schemas, list_objects, get_object_details) to discover the tables and their columns.
 """
 
 
 class MasterDataAgent:
     """Runs one user query through the agentic loop and streams events."""
 
-    def __init__(self, llm: LLMClient, toolbelt: ToolBelt) -> None:
+    def __init__(
+        self, llm: LLMClient, toolbelt: ToolBelt, schema_summary: str | None = None
+    ) -> None:
         settings = get_settings()
         self._llm = llm
         self._tools = toolbelt
+        self._schema_summary = schema_summary
         self._max_steps = max(1, settings.agent_max_steps)
         self._deadline_seconds = settings.agent_deadline_seconds
+
+    def _system_prompt(self) -> str:
+        if self._schema_summary:
+            return f"{_SYSTEM_PROMPT}\nDatabase schema:\n{self._schema_summary}\n"
+        return f"{_SYSTEM_PROMPT}\n{_DISCOVER_SCHEMA_NOTE}"
 
     # -- public API -----------------------------------------------------------
 
@@ -98,8 +123,8 @@ class MasterDataAgent:
         log.info("Agent run started", extra={"query": query, "model": self._llm.model})
 
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": f"Identifier: {query.strip()}"},
+            {"role": "system", "content": self._system_prompt()},
+            {"role": "user", "content": f"User request: {query.strip()}"},
         ]
 
         events: list[dict[str, Any]] = []
@@ -107,7 +132,11 @@ class MasterDataAgent:
         tool_calls: list[dict[str, Any]] = []
         products: dict[int, dict[str, Any]] = {}
         suppliers: dict[int, dict[str, Any]] = {}
+        records: list[dict[str, Any]] = []
         seen_calls: dict[str, ToolResult] = {}
+
+        def has_data() -> bool:
+            return bool(products or suppliers or records)
 
         def emit(node: str, phase: str, message: str, data: dict[str, Any] | None = None):
             event = {
@@ -176,7 +205,7 @@ class MasterDataAgent:
                     continue
 
                 answer = turn.content.strip()
-                status = "complete" if (products or suppliers) else "no_results"
+                status = "complete" if has_data() else "no_results"
                 log.info(
                     "Agent finished",
                     extra={"step": step, "status": status, "llm_time_ms": turn.latency_ms},
@@ -223,7 +252,7 @@ class MasterDataAgent:
                     seen_calls[call_key] = result
 
                 if result.success:
-                    self._absorb(result.data, products, suppliers)
+                    self._absorb(result.data, products, suppliers, records)
 
                 tool_calls.append(
                     {
@@ -261,7 +290,7 @@ class MasterDataAgent:
             log.warning("Agent step budget exhausted")
             yield emit("agent", "budget_exhausted", error)
 
-        if answer is None and status == "incomplete" and (products or suppliers):
+        if answer is None and status == "incomplete" and has_data():
             # The loop was cut off after data was already retrieved. Give the
             # agent one last turn, without tools, to summarize its findings —
             # the summary is still the model's own, not ours.
@@ -306,8 +335,13 @@ class MasterDataAgent:
             "consolidated_data": {
                 "products": list(products.values()),
                 "suppliers": list(suppliers.values()),
+                "records": records,
             },
-            "counts": {"products": len(products), "suppliers": len(suppliers)},
+            "counts": {
+                "products": len(products),
+                "suppliers": len(suppliers),
+                "records": len(records),
+            },
             "reasoning_trace": reasoning_trace,
             "tool_calls": tool_calls,
             "execution_events": events,
@@ -343,15 +377,29 @@ class MasterDataAgent:
         data: dict[str, Any],
         products: dict[int, dict[str, Any]],
         suppliers: dict[int, dict[str, Any]],
+        records: list[dict[str, Any]],
     ) -> None:
-        for record in data.get("products", []):
-            key = record.get("product_id")
-            if key is not None:
-                products[key] = record
-        for record in data.get("suppliers", []):
-            key = record.get("supplier_id")
-            if key is not None:
-                suppliers[key] = record
+        """Bucket retrieved SQL rows by the identifying key they carry.
+
+        Rows without an id column (the model may SELECT only names) still
+        count as retrieved data — they land in the generic records bucket.
+        """
+        for row in data.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            product_id = row.get("product_id")
+            supplier_id = row.get("supplier_id")
+            if product_id is not None:
+                products[product_id] = row
+            elif supplier_id is not None:
+                suppliers[supplier_id] = row
+            elif row not in records:
+                records.append(row)
+            if supplier_id is not None and row.get("supplier_name") is not None:
+                suppliers.setdefault(
+                    supplier_id,
+                    {"supplier_id": supplier_id, "supplier_name": row["supplier_name"]},
+                )
 
     @staticmethod
     def _render_observation(result: ToolResult, repeated: bool) -> str:
@@ -360,12 +408,12 @@ class MasterDataAgent:
         payload = dict(result.data)
         if result.record_count == 0:
             payload["note"] = (
-                "0 records with this identifier_type. Other identifier_type values "
-                "may still match — try them before finishing."
+                "0 rows. Other interpretations of the identifier may still match — "
+                "try them before finishing."
             )
         if repeated:
             payload["note"] = (
-                "You already called this tool with these arguments. Try a different "
-                "interpretation or finish with your answer."
+                "You already ran this exact call. Try a different query "
+                "or finish with your answer."
             )
         return json.dumps(payload, separators=(",", ":"), default=str)

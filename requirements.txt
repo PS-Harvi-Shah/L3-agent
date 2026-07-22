@@ -1,4 +1,4 @@
-fastapi==0.115.6
+fastapi==0.139.0
 uvicorn[standard]==0.34.0
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10
@@ -7,3 +7,5 @@ pydantic-settings==2.7.1
 streamlit==1.41.1
 requests==2.32.3
 httpx==0.28.1
+mcp==1.28.1
+postgres-mcp==0.3.0
